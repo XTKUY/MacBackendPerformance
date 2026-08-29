@@ -388,7 +388,7 @@ impl LiveState {
             .collect();
         match self.sort {
             SortKey::Cpu => v.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct)),
-            SortKey::Mem => v.sort_by(|a, b| b.mem_bytes.cmp(&a.mem_bytes)),
+            SortKey::Mem => v.sort_by_key(|a| std::cmp::Reverse(a.mem_bytes)),
             SortKey::Pid => v.sort_by_key(|p| p.pid),
         }
         v
