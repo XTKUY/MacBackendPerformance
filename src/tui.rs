@@ -38,6 +38,30 @@ fn fmt_elapsed(d: Duration) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+fn fmt_dur(d: chrono::Duration) -> String {
+    let s = d.num_seconds().max(0);
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
+}
+
+fn parse_hms(s: &str) -> i64 {
+    s.split(':').rev().enumerate().fold(0i64, |acc, (i, p)| {
+        acc + p.parse::<i64>().unwrap_or(0) * 60i64.pow(i as u32)
+    })
+}
+
+fn fmt_secs(s: i64) -> String {
+    let s = s.max(0);
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
+}
+
 fn spark<'a>(title: String, data: &[u64], max: u64, style: Style, pal: Palette) -> Sparkline<'a> {
     Sparkline::default()
         .data(data)
@@ -867,10 +891,16 @@ struct InspectState<'a> {
     sys: Vec<SystemRow>,
     agg: Vec<ProcAgg>,
     sel_idx: usize,
+    scroll: usize,
+    vis_rows: usize,
     sel_pid: Option<i64>,
     sel_name: String,
     sel_series: Vec<ProcSeriesView>,
     sort_peak: bool,
+    sleep_episodes: Vec<SleepEpisode>,
+    show_sleep: bool,
+    sleep_scroll: usize,
+    sleep_vis: usize,
     theme: Flavor,
     cpu_s: Vec<u64>,
     gpu_s: Vec<u64>,
@@ -881,6 +911,14 @@ struct InspectState<'a> {
 
 struct ProcSeriesView {
     cpu_pct: f64,
+}
+
+/// 一次睡眠事件：入睡时间 → 唤醒时间 → 持续时长。
+struct SleepEpisode {
+    start: String,
+    end: String,
+    dur: String,
+    source: &'static str,
 }
 
 impl<'a> InspectState<'a> {
@@ -905,10 +943,16 @@ impl<'a> InspectState<'a> {
             sys,
             agg: Vec::new(),
             sel_idx: 0,
+            scroll: 0,
+            vis_rows: 20,
             sel_pid: None,
             sel_name: String::new(),
             sel_series: Vec::new(),
             sort_peak: false,
+            sleep_episodes: Vec::new(),
+            show_sleep: false,
+            sleep_scroll: 0,
+            sleep_vis: 20,
             theme: Flavor::Mocha,
             cpu_s: Vec::new(),
             gpu_s: Vec::new(),
@@ -917,6 +961,7 @@ impl<'a> InspectState<'a> {
             pwr_max: 1,
         };
         st.recalc();
+        st.sleep_episodes = st.build_sleep_episodes();
         st
     }
 
@@ -927,13 +972,14 @@ impl<'a> InspectState<'a> {
     fn recalc(&mut self) {
         let from = self.iso(self.win_from);
         let to = self.iso(self.win_to);
-        let mut agg = storage::process_aggregate(self.conn, self.info.id, &from, &to, 1000)
-            .unwrap_or_default();
+        let mut agg =
+            storage::process_aggregate(self.conn, self.info.id, &from, &to, 0).unwrap_or_default();
         if self.sort_peak {
             agg.sort_by(|a, b| b.peak_cpu.total_cmp(&a.peak_cpu));
         }
         self.agg = agg;
         self.sel_idx = self.sel_idx.min(self.agg.len().saturating_sub(1));
+        self.scroll = self.scroll.min(self.agg.len().saturating_sub(1));
 
         self.cpu_s.clear();
         self.gpu_s.clear();
@@ -1023,6 +1069,61 @@ impl<'a> InspectState<'a> {
         }
     }
 
+    /// 整理本会话的全部睡眠事件（整个会话范围，不受时间窗口影响）。
+    /// 优先用 IOKit 记录的 sleep/wake 事件配对；旧会话没有这些事件时，
+    /// 退回到按 system_samples 的空窗（>10 秒）推断睡眠时段。
+    fn build_sleep_episodes(&self) -> Vec<SleepEpisode> {
+        let mut eps: Vec<SleepEpisode> = Vec::new();
+
+        let mut open: Option<(DateTime<Local>, DateTime<Local>)> = None;
+        for e in &self.events {
+            match e.event_type.as_str() {
+                "sleep" => {
+                    if let Some(dt) = parse_iso(&e.ts) {
+                        open = Some((dt, dt));
+                    }
+                }
+                "wake" => {
+                    if let Some((st, _)) = open.take() {
+                        if let Some(en) = parse_iso(&e.ts) {
+                            eps.push(SleepEpisode {
+                                start: st.format("%H:%M:%S").to_string(),
+                                end: en.format("%H:%M:%S").to_string(),
+                                dur: fmt_dur(en - st),
+                                source: "IOKit",
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !eps.is_empty() {
+            return eps;
+        }
+
+        // 旧会话：按采样空窗推断。真正睡眠时进程挂起、采样中断，
+        // 唤醒后恢复，因此空窗起止时间近似等于睡眠时段。
+        let mut prev: Option<DateTime<Local>> = None;
+        for r in &self.sys {
+            if let Some(dt) = parse_iso(&r.ts) {
+                if let Some(p) = prev {
+                    let gap = dt - p;
+                    if gap.num_seconds() >= 10 {
+                        eps.push(SleepEpisode {
+                            start: p.format("%H:%M:%S").to_string(),
+                            end: dt.format("%H:%M:%S").to_string(),
+                            dur: fmt_dur(gap),
+                            source: "采样空窗推断",
+                        });
+                    }
+                }
+                prev = Some(dt);
+            }
+        }
+        eps
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         let pal = Palette::of(self.theme);
         draw_background(frame, pal);
@@ -1062,14 +1163,27 @@ impl<'a> InspectState<'a> {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(mid);
 
-        // 左：聚合进程表
+        // 左：聚合进程表（可滚动，保证窗口内所有采样进程都能看到）
+        let vis = (left.height as usize).saturating_sub(3).max(1);
+        self.vis_rows = vis;
+        let total = self.agg.len();
+        self.scroll = self.scroll.min(total.saturating_sub(vis));
+        if self.sel_idx < self.scroll {
+            self.scroll = self.sel_idx;
+        } else if self.sel_idx >= self.scroll + vis {
+            self.scroll = self.sel_idx + 1 - vis;
+        }
+        let scroll = self.scroll;
         let header =
             Row::new(vec!["PID", "进程", "平均%", "峰值%", "样本"]).style(pal.title_style());
         let rows: Vec<Row> = self
             .agg
             .iter()
+            .skip(scroll)
+            .take(vis)
             .enumerate()
-            .map(|(i, p)| {
+            .map(|(vi, p)| {
+                let i = scroll + vi;
                 let sel = self.sel_pid == Some(p.pid);
                 let row_style = if i == self.sel_idx {
                     Style::new().fg(pal.text).bg(pal.surface)
@@ -1087,6 +1201,11 @@ impl<'a> InspectState<'a> {
             })
             .collect();
         let sort_txt = if self.sort_peak { "峰值" } else { "平均" };
+        let title = if total > vis {
+            format!("进程聚合（按 {sort_txt} CPU 排序） {}/{total}", scroll + 1)
+        } else {
+            format!("进程聚合（按 {sort_txt} CPU 排序）")
+        };
         let table = Table::new(
             rows,
             [
@@ -1099,7 +1218,7 @@ impl<'a> InspectState<'a> {
         )
         .header(header)
         .column_spacing(1)
-        .block(pal.block(format!("进程聚合（按 {sort_txt} CPU 排序）")));
+        .block(pal.block(title));
         frame.render_widget(table, left);
 
         // 右：系统曲线 + 选中进程曲线
@@ -1192,12 +1311,80 @@ impl<'a> InspectState<'a> {
             .collect();
         lines.push(Line::from(" "));
         lines.push(Line::from(vec![Span::styled(
-            "←/→ 平移 · +/- 缩放 · r 全部 · Enter 选择进程 · s 排序 · t 主题 · q 退出",
+            "←/→ 平移 · +/- 缩放 · r 全部 · Enter 选择进程 · ↑/↓ 选择 · PgUp/PgDn 翻页 · Home/End 首尾 · s 排序 · t 主题 · v 睡眠事件 · q 退出",
             pal.sub_style(),
         )]));
         frame.render_widget(
             Paragraph::new(Text::from(lines)).block(pal.block("电源事件")),
             foot,
+        );
+
+        if self.show_sleep {
+            self.draw_sleep_popup(frame, pal);
+        }
+    }
+
+    fn draw_sleep_popup(&mut self, frame: &mut Frame, pal: Palette) {
+        let total_dur = self
+            .sleep_episodes
+            .iter()
+            .fold(0i64, |acc, e| acc + parse_hms(&e.dur));
+        let block = pal.block(format!(
+            "睡眠事件 · 会话 {} · {} 次 · 合计 {}",
+            self.info.id,
+            self.sleep_episodes.len(),
+            fmt_secs(total_dur)
+        ));
+        let pop = centered_area(frame.area(), 72, 70);
+        frame.render_widget(Clear, pop);
+        frame.render_widget(block.clone(), pop);
+        let inner = block.inner(pop);
+
+        let mut lines: Vec<Line> = Vec::new();
+        if self.sleep_episodes.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "未发现睡眠事件（该会话可能整晚未入睡）",
+                pal.text_style(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "入睡            唤醒            持续    来源",
+                pal.title_style(),
+            )));
+            for e in &self.sleep_episodes {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}  →  {}   {}", e.start, e.end, e.dur),
+                        pal.text_style(),
+                    ),
+                    Span::styled(format!("  [{}]", e.source), pal.overlay),
+                ]));
+            }
+        }
+        lines.push(Line::from(" "));
+        lines.push(Line::from(Span::styled(
+            "↑/↓ 滚动 · PgUp/PgDn 翻页 · Home/End 首尾 · q/Esc/v 关闭",
+            pal.sub_style(),
+        )));
+
+        // 内容区 = 表头 + 数据 + 空行 + 提示；数据行按可视高度滚动。
+        let vis = (inner.height as usize).saturating_sub(3).max(1);
+        self.sleep_vis = vis;
+        let data_start = 1;
+        let data_end = lines.len().saturating_sub(2); // 去掉空行和提示行
+        let data_len = data_end.saturating_sub(data_start);
+        let max_scroll = data_len.saturating_sub(vis);
+        self.sleep_scroll = self.sleep_scroll.min(max_scroll);
+        let from = data_start + self.sleep_scroll;
+        let to = (from + vis).min(data_end);
+
+        let mut shown: Vec<Line> = lines[..data_start.min(lines.len())].to_vec();
+        shown.extend(lines[from..to.max(from)].iter().cloned());
+        shown.extend(lines[lines.len().saturating_sub(1)..].to_vec());
+
+        frame.render_widget(
+            Paragraph::new(Text::from(shown)).style(Style::new().bg(pal.bg)),
+            inner,
         );
     }
 }
@@ -1236,26 +1423,67 @@ pub fn run_inspect_terminal(
             if k.kind != KeyEventKind::Press {
                 continue;
             }
-            match k.code {
-                KeyCode::Char('q') | KeyCode::Esc => quit = true,
-                KeyCode::Left => state.shift(-0.1),
-                KeyCode::Right => state.shift(0.1),
-                KeyCode::Char('+') | KeyCode::Char('=') => state.zoom(0.5),
-                KeyCode::Char('-') | KeyCode::Char('_') => state.zoom(2.0),
-                KeyCode::Char('r') => state.reset_window(),
-                KeyCode::Enter => state.toggle_select(),
-                KeyCode::Up => {
-                    state.sel_idx = state.sel_idx.saturating_sub(1);
+            if state.show_sleep {
+                // 睡眠事件窗口：方向键滚动，q/Esc/v 关闭。
+                match k.code {
+                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('v') => {
+                        state.show_sleep = false
+                    }
+                    KeyCode::Up => state.sleep_scroll = state.sleep_scroll.saturating_sub(1),
+                    KeyCode::Down => {
+                        let max = state.sleep_episodes.len().saturating_sub(state.sleep_vis);
+                        state.sleep_scroll = (state.sleep_scroll + 1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        let page = state.sleep_vis.max(1);
+                        state.sleep_scroll = state.sleep_scroll.saturating_sub(page);
+                    }
+                    KeyCode::PageDown => {
+                        let page = state.sleep_vis.max(1);
+                        let max = state.sleep_episodes.len().saturating_sub(state.sleep_vis);
+                        state.sleep_scroll = (state.sleep_scroll + page).min(max);
+                    }
+                    KeyCode::Home => state.sleep_scroll = 0,
+                    KeyCode::End => {
+                        state.sleep_scroll =
+                            state.sleep_episodes.len().saturating_sub(state.sleep_vis);
+                    }
+                    _ => {}
                 }
-                KeyCode::Down => {
-                    state.sel_idx = (state.sel_idx + 1).min(state.agg.len().saturating_sub(1));
+            } else {
+                match k.code {
+                    KeyCode::Char('q') | KeyCode::Esc => quit = true,
+                    KeyCode::Left => state.shift(-0.1),
+                    KeyCode::Right => state.shift(0.1),
+                    KeyCode::Char('+') | KeyCode::Char('=') => state.zoom(0.5),
+                    KeyCode::Char('-') | KeyCode::Char('_') => state.zoom(2.0),
+                    KeyCode::Char('r') => state.reset_window(),
+                    KeyCode::Enter => state.toggle_select(),
+                    KeyCode::Up => {
+                        state.sel_idx = state.sel_idx.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        state.sel_idx = (state.sel_idx + 1).min(state.agg.len().saturating_sub(1));
+                    }
+                    KeyCode::PageUp => {
+                        let page = state.vis_rows.max(1);
+                        state.sel_idx = state.sel_idx.saturating_sub(page);
+                    }
+                    KeyCode::PageDown => {
+                        let page = state.vis_rows.max(1);
+                        state.sel_idx =
+                            (state.sel_idx + page).min(state.agg.len().saturating_sub(1));
+                    }
+                    KeyCode::Home => state.sel_idx = 0,
+                    KeyCode::End => state.sel_idx = state.agg.len().saturating_sub(1),
+                    KeyCode::Char('v') => state.show_sleep = true,
+                    KeyCode::Char('s') => {
+                        state.sort_peak = !state.sort_peak;
+                        state.recalc();
+                    }
+                    KeyCode::Char('t') => state.theme = state.theme.next(),
+                    _ => {}
                 }
-                KeyCode::Char('s') => {
-                    state.sort_peak = !state.sort_peak;
-                    state.recalc();
-                }
-                KeyCode::Char('t') => state.theme = state.theme.next(),
-                _ => {}
             }
         }
     }

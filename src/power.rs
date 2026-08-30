@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::model::{now, PowerEvent, PowerEventKind, SampleMsg};
 
@@ -100,7 +100,11 @@ unsafe extern "C" fn power_callback(
 ) {
     let ctx = &*(refcon as *const PowerCtx);
     match message_type {
-        KIO_MESSAGE_SYSTEM_WILL_SLEEP => ctx.emit(PowerEventKind::Sleep, "system will sleep"),
+        KIO_MESSAGE_SYSTEM_WILL_SLEEP => {
+            // 必须应答 IOAllowPowerChange，否则系统会等待并可能推迟/放弃本次睡眠。
+            IOAllowPowerChange(ctx.conn, message_arg as isize);
+            ctx.emit(PowerEventKind::Sleep, "system will sleep");
+        }
         KIO_MESSAGE_SYSTEM_HAS_POWERED_ON => {
             ctx.emit(PowerEventKind::Wake, "system has powered on")
         }
@@ -126,7 +130,7 @@ unsafe extern "C" fn stop_timer_callout(_timer: *mut c_void, info: *mut c_void) 
     }
 }
 
-/// 启动 IOKit 电源事件监听线程（CFRunLoop 0.2s 轮询以便退出）。
+/// 启动 IOKit 电源事件监听线程（CFRunLoop 阻塞运行，低频定时器检查退出标志）。
 pub fn spawn_power_monitor(
     write_tx: Sender<SampleMsg>,
     ui_tx: Sender<SampleMsg>,
@@ -136,6 +140,7 @@ pub fn spawn_power_monitor(
         unsafe {
             let port = IONotificationPortCreate(0);
             if port.is_null() {
+                eprintln!("[neko-perf] IONotificationPortCreate 失败，电源事件不可用");
                 return;
             }
             let ctx = Box::into_raw(Box::new(PowerCtx {
@@ -152,6 +157,7 @@ pub fn spawn_power_monitor(
                 &mut notifier,
             );
             if conn == 0 {
+                eprintln!("[neko-perf] IORegisterForSystemPower 注册失败，电源事件不可用");
                 let _ = Box::from_raw(ctx);
                 IONotificationPortDestroy(port);
                 return;
@@ -171,7 +177,10 @@ pub fn spawn_power_monitor(
                 0x0800_0100, // kCFStringEncodingUTF8
             );
             let rl = CFRunLoopGetCurrent();
+            // 同时挂到 common modes 和 default mode：CFRunLoopRun() 跑在 default mode，
+            // 显式加入 default mode 保证 IOKit 通知一定被当前运行的模式调度到。
             CFRunLoopAddSource(rl, source, common_mode);
+            CFRunLoopAddSource(rl, source, default_mode);
 
             // 阻塞式运行；用定时器定期检查 stop，避免忙轮询占满一个核。
             let stop_ptr = Arc::into_raw(stop.clone());
@@ -226,13 +235,9 @@ pub fn spawn_assertion_monitor(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            let Ok(out) = Command::new("pmset").args(["-g", "assertions"]).output() else {
+            let Some(text) = pmset_assertions(Duration::from_secs(10)) else {
                 continue;
             };
-            if !out.status.success() {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&out.stdout);
             let relevant: Vec<String> = text
                 .lines()
                 .filter(|l| l.contains("Prevent") || l.contains("named:"))
@@ -241,13 +246,20 @@ pub fn spawn_assertion_monitor(
             if relevant.is_empty() {
                 continue;
             }
-            let digest = relevant.join("\n");
+            // 用去掉时长字段的摘要做变化检测：pmset 里的倒计时 / 累计时长
+            // （如 00:33:10、240:20:03）每分钟都在变，会误判为断言变化。
+            let digest = relevant
+                .iter()
+                .map(|l| strip_durations(l))
+                .collect::<Vec<_>>()
+                .join("\n");
             if Some(&digest) != last.as_ref() {
                 last = Some(digest.clone());
-                let detail = if digest.len() > 600 {
-                    format!("{} …（截断）", &digest[..600])
+                let raw = relevant.join("\n");
+                let detail = if raw.len() > 600 {
+                    format!("{} …（截断）", &raw[..600])
                 } else {
-                    digest
+                    raw
                 };
                 let ev = PowerEvent {
                     ts: now(),
@@ -259,4 +271,94 @@ pub fn spawn_assertion_monitor(
             }
         }
     })
+}
+
+/// 抓取 `pmset -g assertions`，带超时保护；超时返回 None（跳过本轮）。
+fn pmset_assertions(timeout: Duration) -> Option<String> {
+    let mut child = Command::new("pmset")
+        .args(["-g", "assertions"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().ok()? {
+            Some(_) => break,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// 把行内的时间字段（如 `00:00:34`、`240:20:03`）替换为 `<t>`，
+/// 便于比较断言集合是否真的发生变化。
+fn strip_durations(line: &str) -> String {
+    line.split(' ')
+        .map(|tok| if is_duration(tok) { "<t>" } else { tok })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 判断 token 是否为 `H:MM:SS`（小时 1-3 位）形式的时长。
+fn is_duration(tok: &str) -> bool {
+    let parts: Vec<&str> = tok.split(':').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let (h, m, s) = (parts[0], parts[1], parts[2]);
+    !h.is_empty()
+        && h.len() <= 3
+        && h.bytes().all(|b| b.is_ascii_digit())
+        && m.len() == 2
+        && m.bytes().all(|b| b.is_ascii_digit())
+        && s.len() == 2
+        && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_duration, strip_durations};
+
+    #[test]
+    fn duration_tokens_are_recognized() {
+        assert!(is_duration("00:00:34"));
+        assert!(is_duration("240:20:03"));
+        assert!(is_duration("1:02:03"));
+        assert!(!is_duration("1234:20:03")); // 小时超过 3 位
+        assert!(!is_duration("00:0:03")); // 分不是 2 位
+        assert!(!is_duration("0x000b449400019b45"));
+        assert!(!is_duration("DASActivity:501:com.apple"));
+        assert!(!is_duration("PreventSystemSleep"));
+    }
+
+    #[test]
+    fn durations_are_stripped_but_content_kept() {
+        assert_eq!(
+            strip_durations("PreventUserIdleDisplaySleep    0"),
+            "PreventUserIdleDisplaySleep    0"
+        );
+        assert_eq!(
+            strip_durations(
+                "pid 616(dasd): [0x000b3c20000b98e0] 00:33:10 BackgroundTask named: \"DASActivity:501:com.apple.Safari.SafeBrowsing.BrowsingDatabases.Update\""
+            ),
+            "pid 616(dasd): [0x000b3c20000b98e0] <t> BackgroundTask named: \"DASActivity:501:com.apple.Safari.SafeBrowsing.BrowsingDatabases.Update\""
+        );
+        assert_eq!(
+            strip_durations(
+                "pid 578(powerd): [0x000000690008809b] 251:48:00 ExternalMedia named: \"com.apple.powermanagement.externalmediamounted\""
+            ),
+            "pid 578(powerd): [0x000000690008809b] <t> ExternalMedia named: \"com.apple.powermanagement.externalmediamounted\""
+        );
+    }
 }

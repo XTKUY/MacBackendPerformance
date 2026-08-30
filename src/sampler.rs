@@ -129,28 +129,50 @@ pub fn spawn_soc_sampler(
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut sampler = match macmon::Sampler::new() {
-            Ok(s) => s,
-            Err(e) => {
-                let detail = format!("IOReport 采样器初始化失败（GPU/功耗数据不可用）: {e}");
-                let msg = SampleMsg::SocUnavailable(detail);
-                let _ = write_tx.send(SampleMsg::SocUnavailable(
-                    "IOReport 采样器初始化失败（GPU/功耗数据不可用）".to_string(),
-                ));
-                let _ = ui_tx.send(msg);
-                return;
+        // macmon 的 get_metrics 会阻塞当前线程，IOReport 偶发长时间卡住（曾观测到
+        // ~18 分钟空窗）。把采样放进专用工作线程，主循环用超时接收：卡住时跳过
+        // 本拍继续等待，退出时也不等待工作线程返回。
+        let (tx, rx) = std::sync::mpsc::channel::<Result<macmon::Metrics, String>>();
+        let w_stop = stop.clone();
+        let w_runtime = runtime.clone();
+        thread::spawn(move || {
+            let mut sampler = match macmon::Sampler::new() {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(format!(
+                        "IOReport 采样器初始化失败（GPU/功耗数据不可用）: {e}"
+                    )));
+                    return;
+                }
+            };
+            while !w_stop.load(Ordering::Relaxed) {
+                let interval_ms = w_runtime.interval_ms.load(Ordering::Relaxed);
+                match sampler.get_metrics(interval_ms as u32) {
+                    Ok(m) => {
+                        if tx.send(Ok(m)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                }
             }
-        };
+        });
 
         while !stop.load(Ordering::Relaxed) {
             let interval_ms = runtime.interval_ms.load(Ordering::Relaxed);
-            let m = match sampler.get_metrics(interval_ms as u32) {
-                Ok(m) => m,
-                Err(_) => continue,
+            // 正常一拍的耗时约等于 interval；超时（interval + 5s 余量）视为
+            // IOReport 卡住，跳过本拍，不让采样线程拖住退出或后续采样。
+            let timeout = Duration::from_millis(interval_ms.saturating_add(5000));
+            let m = match rx.recv_timeout(timeout) {
+                Ok(Ok(m)) => m,
+                Ok(Err(detail)) => {
+                    let _ = write_tx.send(SampleMsg::SocUnavailable(detail.clone()));
+                    let _ = ui_tx.send(SampleMsg::SocUnavailable(detail));
+                    return;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
 
             let c = ctx.lock().unwrap().clone();
             let s = SystemSample {

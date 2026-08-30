@@ -338,29 +338,55 @@ pub fn process_aggregate(
     to: &str,
     limit: usize,
 ) -> Result<Vec<ProcAgg>> {
-    let mut stmt = conn.prepare(
-        "SELECT pid, name,
-                COUNT(*)                       AS samples,
-                ROUND(AVG(cpu_pct), 1)         AS avg_cpu,
-                MAX(cpu_pct)                   AS peak_cpu,
-                ROUND(AVG(mem_bytes) / 1048576.0, 1) AS avg_mem_mb
-         FROM process_samples
-         WHERE session_id = ?1 AND ts >= ?2 AND ts <= ?3
-         GROUP BY pid, name
-         ORDER BY avg_cpu DESC
-         LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(params![session_id, from, to, limit as i64], |r| {
-        Ok(ProcAgg {
-            pid: r.get(0)?,
-            name: r.get(1)?,
-            samples: r.get(2)?,
-            avg_cpu: r.get(3)?,
-            peak_cpu: r.get(4)?,
-            avg_mem: r.get(5)?,
-        })
-    })?;
-    rows.collect()
+    // limit == 0 表示不设上限，加载该窗口内采到的全部进程。
+    if limit == 0 {
+        let mut stmt = conn.prepare(
+            "SELECT pid, name,
+                    COUNT(*)                       AS samples,
+                    ROUND(AVG(cpu_pct), 1)         AS avg_cpu,
+                    MAX(cpu_pct)                   AS peak_cpu,
+                    ROUND(AVG(mem_bytes) / 1048576.0, 1) AS avg_mem_mb
+             FROM process_samples
+             WHERE session_id = ?1 AND ts >= ?2 AND ts <= ?3
+             GROUP BY pid, name
+             ORDER BY avg_cpu DESC",
+        )?;
+        let rows = stmt.query_map(params![session_id, from, to], |r| {
+            Ok(ProcAgg {
+                pid: r.get(0)?,
+                name: r.get(1)?,
+                samples: r.get(2)?,
+                avg_cpu: r.get(3)?,
+                peak_cpu: r.get(4)?,
+                avg_mem: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT pid, name,
+                    COUNT(*)                       AS samples,
+                    ROUND(AVG(cpu_pct), 1)         AS avg_cpu,
+                    MAX(cpu_pct)                   AS peak_cpu,
+                    ROUND(AVG(mem_bytes) / 1048576.0, 1) AS avg_mem_mb
+             FROM process_samples
+             WHERE session_id = ?1 AND ts >= ?2 AND ts <= ?3
+             GROUP BY pid, name
+             ORDER BY avg_cpu DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![session_id, from, to, limit as i64], |r| {
+            Ok(ProcAgg {
+                pid: r.get(0)?,
+                name: r.get(1)?,
+                samples: r.get(2)?,
+                avg_cpu: r.get(3)?,
+                peak_cpu: r.get(4)?,
+                avg_mem: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -477,6 +503,42 @@ mod tests {
         );
         assert_eq!(power_events_range(&conn, sid, from, &to).unwrap().len(), 1);
         assert_eq!(system_series(&conn, sid, from, &to).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_aggregate_limit_zero_returns_all() {
+        let dir = std::env::temp_dir().join(format!("neko-test-agg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let _ = std::fs::remove_file(&path);
+
+        let mut st = Storage::open(&path, Some("Apple M-Test"), 16 << 30).unwrap();
+        let sid = st.session_id();
+        let ts = now();
+        let ps: Vec<ProcessSample> = (1..=3)
+            .map(|pid| ProcessSample {
+                ts,
+                pid,
+                name: format!("proc{pid}"),
+                cpu_pct: pid as f32,
+                mem_bytes: 1024,
+            })
+            .collect();
+        st.insert_processes(&ps).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let from = "1970-01-01T00:00:00+08:00";
+        let to = now_iso();
+        assert_eq!(
+            process_aggregate(&conn, sid, from, &to, 0).unwrap().len(),
+            3
+        );
+        assert_eq!(
+            process_aggregate(&conn, sid, from, &to, 2).unwrap().len(),
+            2
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

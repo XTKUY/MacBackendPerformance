@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- 历史回放进程列表支持滚动：`↑/↓` 选择、`PgUp/PgDn` 翻页、`Home/End` 跳到首尾，窗口内所有采样到的进程都能显示
+- 回放进程聚合不再有 1000 行上限，按窗口加载全部进程
+- 历史回放新增睡眠事件窗口（`v` 键）：列出本会话全部睡眠事件的入睡 / 唤醒时间与持续时长；优先用 IOKit 记录的 sleep/wake 事件配对，旧会话自动按采样空窗推断
+
+### Fixed
+
+- 电源断言每分钟刷一条：变化检测前剥掉 `pmset` 输出里的时长字段（倒计时 / 累计时长），只有断言集合真正变化才记录
+- `pmset -g assertions` 增加 10 秒超时，避免采样线程被挂住
+- IOReport（GPU / 功耗 / 温度）采样改为工作线程 + 超时接收，采样卡住时跳过本拍、退出不再等待（曾出现 ~18 分钟空窗）
+- IOKit 电源监听修复：`system will sleep` 时正确调用 `IOAllowPowerChange` 应答；通知源同时挂到 default mode 与 common modes；注册失败时输出错误日志（此前 sleep / wake 事件一条都没有记录）
+
 ## [0.1.0] - 2026-08-29
 
 首个可用版本（MVP）。
@@ -27,4 +42,3 @@
 
 - 仅支持 Apple Silicon（Intel 无 IOReport GPU 通道）
 - 逐进程 GPU 归因无公共 API，进程表为 CPU / 内存维度
-
