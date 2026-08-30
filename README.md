@@ -121,7 +121,17 @@ CLI 显式参数优先于配置文件；配置文件不存在时使用内置默�
 
 ## 数据存储
 
-SQLite（WAL 模式），四张表：
+SQLite（WAL 模式）。**每个历史会话独立存档**：主库 `neko-perf.db` 只保留会话索引表，各会话的采样数据存放在同目录 `sessions/` 文件夹下、以会话 ID 命名的独立数据库文件中：
+
+```text
+neko-perf.db            # 会话索引（sessions 表，含各会话 db_path）
+sessions/
+├── 1.db                # 会话 1 的 system/process/power 三张表
+├── 2.db
+└── …
+```
+
+每个 `sessions/<ID>.db` 自包含一条同 ID 的会话元数据，可单独拷贝/归档。旧版本单库数据会在首次读取时自动拆分迁移。
 
 | 表 | 内容 |
 | --- | --- |
@@ -130,7 +140,14 @@ SQLite（WAL 模式），四张表：
 | `process_samples` | 进程级采样：PID、进程名、CPU%、内存 |
 | `power_events` | 电源事件：sleep / wake / will_not_sleep / assertion_changed |
 
-估算：1s 系统采样 + 2s 进程采样（Top 15），24 小时约 50–80 MB。可用 SQLite 自带 `sqlite3` 直接查询。
+估算：1s 系统采样 + 2s 进程采样（Top 15），24 小时约 50–80 MB。可用 SQLite 自带 `sqlite3` 直接查询，例如：
+
+```bash
+sqlite3 neko-perf.db 'SELECT id, started_at FROM sessions;'      # 会话索引
+sqlite3 sessions/4.db 'SELECT COUNT(*) FROM process_samples;'    # 某个会话的数据
+```
+
+历史会话列表里按 `d` 可删除会话（有确认窗口），会同时移除索引行与对应数据文件。
 
 ## 工作原理
 
